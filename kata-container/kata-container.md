@@ -76,3 +76,525 @@ syscall open()，原始 linux kernel 中的 open 系统调用极易受到系统�
 
 gViosr 虽然目前没有任何优势，但是这种通过在用户空间运行一个 linux 内核并运行应用程序的思路，在之后可能会广泛应用。kata 目前的技术已经成熟并且相对比较好理解。
 
+# 安全容器的设计部分
+
+因为安全容器是在物理机和容器间新增了一个隔离层，所以不可以 k8s 的组件设置为 kata 否则将不能共享主机的资源以及内核参数。
+
+## 需要解决问题
+
+### 容器逃逸
+
+黑客进入到容器，通过容器中共享宿主机内核的内核漏洞提权到宿主机。
+
+### 故障影响
+
+kernel-pannic 因为底层共享的是同一个内核，所以当共享内核时共享的 syscall 系统调用，可能会出现内核 Bug，如果在一台机器上出现了内核 Bug 则该主机上的所有 Pod 将会停止运行。
+
+![image-20210507134608326](kata-container/image-20210507134608326.png)
+
+### 资源竞争：性能抖动源泉
+
+在 Linux 中会出现服务运行速度时快时慢，这是因为在 Linux 中不同的服务之间对共享资源发生了争夺。
+
+![image-20210507135229802](kata-container/image-20210507135229802.png)
+
+## 解决方法
+
+![image-20210507135951007](kata-container/image-20210507135951007.png)
+
+增加一个虚拟层，当然可以直接部署到宿主机的虚拟机中，但是这种方式会极大的放慢主机的性能，因为现在使用的虚拟机技术，例如 vsphere kvm 等虚拟化方式都是基于宿主机之上重构一个完整的虚拟化的主机，及其庞大，并不适用于轻量简洁运行的云原生生态，但是 kata 中集成了专为云原生研发的虚拟化使用的定制内核。
+
+**即使用 kata 即可解决上述问题。**
+
+# 安装kata-container
+
+可以在 github 中的[官方下载教程](https://github.com/kata-containers/kata-containers/tree/main/docs/install)下载 kata-container 每个系统有不同的安装方式。
+
+我使用的是 debian 系统，所以就使用 debian 系统进行安装，教程如下：
+
+```bash
+$ export DEBIAN_FRONTEND=noninteractive
+$ ARCH=$(arch)
+$ BRANCH="${BRANCH:-master}"
+$ source /etc/os-release
+$ [ "$ID" = debian ] && [ -z "$VERSION_ID" ] && echo >&2 "ERROR: Debian unstable not supported.
+  You can try stable packages here:
+  http://download.opensuse.org/repositories/home:/katacontainers:/releases:/${ARCH}:/${BRANCH}" && exit 1
+$ sudo sh -c "echo 'deb http://download.opensuse.org/repositories/home:/katacontainers:/releases:/${ARCH}:/${BRANCH}/Debian_${VERSION_ID}/ /' > /etc/apt/sources.list.d/kata-containers.list"
+$ curl -sL  http://download.opensuse.org/repositories/home:/katacontainers:/releases:/${ARCH}:/${BRANCH}/Debian_${VERSION_ID}/Release.key | sudo apt-key add -
+$ sudo -E apt-get update
+$ sudo -E apt-get -y install kata-runtime kata-proxy kata-shim
+```
+
+如果出现 `gpg: no valid OpenPGP data found.` 的错误，那么可以在浏览器打开 apt 密钥的网页，复制到虚拟机中，之后通过 `apt-key add [filename]` 添加密钥。
+
+安装过程中出现 404 可能是新版本的源并没有更新，修改镜像源即可。
+
+## 更换内核版本
+
+```bash
+./build-kernel.sh -v 4.19.86 -b -g nvidia -f -d setup
+
+-v 4.19.86：指定来宾内核版本。
+-b：在来宾内核中启用BPF相关功能。
+-g nvidia：构建支持Nvidia GPU的来宾内核。
+-f注意：即使内核目录已经存在，也会强制生成.config文件。
+-d：启用bash调试模式。
+```
+
+```bash
+go get -d -u github.com/kata-containers/packaging
+```
+
+编译内核，在编译时会提示出现 `make oldconfig` 字样，需要先生成 `.config` 文件之后才可以编译。
+
+`.config` 文件中的内容生成的是对 linux 内核的定制。
+
+```bash
+./build-kernel.sh build
+```
+
+安装内核，安装完成后会自动修改 `/usr/share/kata-containers/defaults/configuration.toml` 路径下文件中指定的内核路径。
+
+```bash
+./build-kernel.sh install
+```
+
+# 结合Docker
+
+kata-container 运行时检查，检查通过后即可。
+
+```bash
+kata-runtime kata-check
+```
+
+执行下条命令将 docker 在 unit 文件中的选项插入到 `/etc/default/docker` 文件中。
+
+```bash
+sh -c "echo '# specify docker runtime for kata-containers
+DOCKER_OPTS=\"-D --add-runtime kata-runtime=/usr/bin/kata-runtime --default-runtime=kata-runtime\"' >> /etc/default/docker"
+```
+
+设置 `kata-container` 的配置（下面一步做了这步可以不做）
+
+```bash
+cat <<EOF |  tee /etc/systemd/system/docker.service.d/kata-containers.conf
+[Service]
+ExecStart=
+ExecStart=/usr/bin/dockerd -D --add-runtime kata-runtime=/usr/bin/kata-runtime --default-runtime=kata-runtime
+EOF
+```
+
+设置 `daemon.json` 文件内容（上面一步做了这步可以不做）（建议做此步）
+
+```json
+mkdir -p /etc/docker
+
+cat <<EOF | tee /etc/docker/daemon.json
+{
+  "default-runtime": "kata-runtime",
+  "runtimes": {
+    "kata-runtime": {
+      "path": "/usr/bin/kata-runtime"
+    }
+  }
+}
+EOF
+```
+
+重启docker
+
+```bash
+systemctl daemon-reload
+
+systemctl restart docker
+```
+
+运行容器并验证其内部的工作内核，并不是与主机是相同内核，而是通过kata-container虚拟出的一个内核
+
+```bash
+root@client:~# docker run -it busybox uname -r
+5.4.60-52.container
+root@client:~# uname -r
+5.4.0-47-generic
+```
+
+> 一般容器运行
+>
+> ```bash
+> root@k8s-master1:~# docker run -it busybox uname -r
+> 4.19.0-13-amd64
+> root@k8s-master1:~# uname -r
+> 4.19.0-13-amd64
+> ```
+
+在进程中的体现，其中运行了 kata-proxy 用力啊实现堆吼端的代理，其指定监听了指定的 docker 容器 socket。
+
+
+
+![image-20210331151936162](kata-container/image-20210331151936162.png)
+
+运行的 kata-shim 通过 docker socket 在容器中建立了 agent，并且 kata-shim 指定的容器 ID 与使用 docker 命令查询出的 docker ID 相同。
+
+![image-20210331152125637](kata-container/image-20210331152125637.png)
+
+每次创建容器都会创建一组 kata-proxy 以及 kata-agent。
+
+### 安装遇到的问题
+
+**检查不通过**
+
+开启虚拟机的嵌套虚拟化
+
+挂载模块
+
+```bash
+tee /etc/modprobe.d/blacklist-vmware.conf << EOF
+blacklist vmw_vsock_virtio_transport_common
+blacklist vmw_vsock_vmci_transport
+EOF
+
+reboot
+```
+
+# cri-o + kata-container + kubeadm
+
+## 安装CRI-O
+
+**使用 cri-o 方式安装的 kata-container + kubernetes 最终失败，因为其中 cri-o 中指定的 pasue 镜像一直是拉取不下来，就算修改了 cri-o conf 文件也无济于事，还是会找到默认国外的源，解决这种方式可以通过连接到国外 vpn 的方式实现安装。**
+
+根据 CRI-O 官方安装 CRI-O [CRI-O官方安装教程](https://github.com/cri-o/cri-o/blob/master/install.md#apt-based-operating-systems)。
+
+ubuntu安装方式，其中需要定义 OS 变量。
+
+| Operating system | $OS               |
+| ---------------- | ----------------- |
+| Debian Unstable  | `Debian_Unstable` |
+| Debian Testing   | `Debian_Testing`  |
+| Raspberry Pi OS  | `Raspbian_10`     |
+| Ubuntu 20.04     | `xUbuntu_20.04`   |
+| Ubuntu 19.10     | `xUbuntu_19.10`   |
+| Ubuntu 19.04     | `xUbuntu_19.04`   |
+| Ubuntu 18.04     | `xUbuntu_18.04`   |
+
+```bash
+source /etc/os-release
+echo "deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/$OS/ /" > /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
+echo "deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/$VERSION/$OS/ /" > /etc/apt/sources.list.d/devel:kubic:libcontainers:stable:cri-o:$VERSION.list
+
+curl -L https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable:cri-o:$VERSION/$OS/Release.key | apt-key add -
+curl -L https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/$OS/Release.key | apt-key add -
+
+apt-get update
+apt-get install cri-o cri-o-runc
+
+`想要使用 runc 添加这个版本即可`
+cat > /etc/crio/crio.conf.d/01-crio-runc.conf <<EOF
+[crio.runtime.runtimes.runc]
+runtime_path = ""
+runtime_type = "oci"
+runtime_root = "/run/runc"
+EOF
+```
+
+如果安装密钥出现 `gpg: no valid OpenPGP data found.` 警告，手动打开密钥存在的网页，找到绝对路径即可。
+
+## 配置 crio conf 文件
+
+```bash
+#指定 kata-runtime 的管理程序，runtime qemu 以及 fc 全部交由 kata-container 进行管理
+cat > 02-crio-kataruntime.conf <<EOF
+[crio.runtime.runtimes.kata-runtime]
+  runtime_path = "/usr/bin/kata-runtime"
+  runtime_type = "oci"
+
+[crio.runtime.runtimes.kata-qemu]
+  runtime_path = "/usr/bin/kata-runtime"
+  runtime_type = "oci"
+
+[crio.runtime.runtimes.kata-fc]
+  runtime_path = "/usr/bin/kata-runtime"
+  runtime_type = "oci"
+EOF
+
+
+systemctl restart crio
+```
+
+### 配置 crio.conf 文件
+
+```bash
+###有则修改，无则添加
+#因为 kata 运行的工作负载要使用网络，所以将 cri-o 管理网络名称空间的选项设置为 True
+manage_ns_lifecycle = true
+
+runtime = "/usr/bin/runc"
+runtime_untrusted_workload = "/usr/bin/kata-runtime"
+default_workload_trust = "untrusted"
+```
+
+## 安装kubernetes
+
+```bash
+cat > /etc/apt/sources.list.d/kubernetes.list <<EOF
+#中科大源
+deb http://mirrors.ustc.edu.cn/kubernetes/apt kubernetes-xenial main
+EOF
+```
+
+添加密钥
+
+![image-20210401113237831](kata-container/image-20210401113237831.png)
+
+```bash
+gpg --keyserver keyserver.ubuntu.com --recv-keys 6A030B21BA07F4FB
+gpg --export --armor 6A030B21BA07F4FB | sudo apt-key add -
+```
+
+添加密钥后执行 `apt update && apt-get install -y kubelet kubeadm kubectl` 安装 kubernetes 所需组件。
+
+安装完成后进行准备工作：
+
+1. 关闭 swap 交换分区
+2. 修改拉取源
+
+## 设置unit文件
+
+```bash
+配置 CRI-O
+cat > /etc/systemd/system/kubelet.service.d/0-crio.conf <<EOF
+[Service]
+Environment="KUBELET_EXTRA_ARGS=--container-runtime=remote --runtime-request-timeout=15m --container-runtime-endpoint=unix:///var/run/crio/crio.sock"
+EOF
+
+配置容器
+cat > /etc/systemd/system/kubelet.service.d/0-cri-containerd.conf <<EOF
+[Service]
+Environment="KUBELET_EXTRA_ARGS=--container-runtime=remote --runtime-request-timeout=15m --container-runtime-endpoint=unix:///run/containerd/containerd.sock"
+EOF
+```
+
+**初始化 kubernetes**
+
+```bash
+kubeadm init  --cri-socket /var/run/crio/crio.sock --image-repository=registry.aliyuncs.com/google_containers --kubernetes-version=v1.20.5 --pod-network-cidr=10.244.0.0/16   --apiserver-advertise-address=10.0.0.9
+```
+
+初始化完成后即可使用。
+
+# containerd + kata-container + kubernetes
+
+这种方式修改了 containerd 拉取镜像源后，即可安装成功。假设现有环境已经安装 kata-container + crictl
+
+## 安装containerd
+
+基于[官方文档](https://containerd.io/downloads/)下载安装即可。
+
+## 配置kubelet
+
+```bash
+$ sudo mkdir -p  /etc/systemd/system/kubelet.service.d/ 
+$ cat << EOF | sudo tee  /etc/systemd/system/kubelet.service.d/0-containerd.conf 
+[Service]
+Environment="KUBELET_EXTRA_ARGS=--container-runtime=remote --runtime-request-timeout=15m --container-runtime-endpoint=unix:///run/containerd/containerd.sock" 
+EOF 
+```
+
+## 配置containerd
+
+### 修改配置文件
+
+```bash
+      [plugins."io.containerd.grpc.v1.cri".containerd.untrusted_workload_runtime]
+        runtime_type = "io.containerd.runtime.v1.linux"
+        runtime_engine = "/usr/bin/kata-runtime"
+        runtime_root = ""
+        privileged_without_host_devices = false
+        base_runtime_spec = ""
+```
+
+### 重启 containerd
+
+```bash
+[root@master ~]# systemctl restart containerd
+```
+
+### 修改 crictl 配置
+
+```bash
+[root@master ~]# cat /etc/crictl.yaml
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 10
+debug: false
+```
+
+### 使用kubeadm安装kubernetes集群
+
+```bash
+kubeadm init --cri-socket=/run/containerd/containerd.sock --image-repository=registry.aliyuncs.com/google_containers --kubernetes-version=v1.20.5 --pod-network-cidr=10.244.0.0/16   --apiserver-advertise-address=10.0.0.9
+```
+
+### 安装完成后测试
+
+创建 Pod 的 yaml 文件
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: busybox01
+  # 添加注释，标注使用 kata-container 运行该 Pod
+  annotations:
+    io.kubernetes.cri.untrusted-workload: "true"
+spec:
+  containers:
+  - name: busybox
+    image: busybox:latest
+    command: ["/bin/sh","-c","sleep 600"]
+```
+
+查看 Pod 使用的运行时
+
+```bash
+[root@master ~]# crictl inspect 03bc82ab3d8d7|grep kata
+      "runtime": "/usr/bin/kata-runtime"
+```
+
+最终效果实现，Pod 中使用的内核与外部不相同，默认情况下，kata-container 会自动尽量的契合系统内核，尽量达到内核号相同。升级宿主机内核后，内核将不会相同。这也就代表安装的 kata-container 已经作为容器底层的运行时。
+
+![image-20210406183610950](kata-container/image-20210406183610950.png)
+
+# 基于runtimeclass调度不同运行时容器
+
+可以在不同的 Pod 设置不同的 RuntimeClass，以提供性能与安全性之间的平衡。 例如，如果你的部分工作负载需要高级别的信息安全保证，你可以决定在调度这些 Pod 时尽量使它们在使用硬件虚拟化的容器运行时中运行。 这样，你将从这些不同运行时所提供的额外隔离中获益，代价是一些额外的开销。
+
+你还可以使用 RuntimeClass 运行具有相同容器运行时但具有不同设置的 Pod。
+
+![image-20210507141254378](kata-container/image-20210507141254378.png)
+
+RuntimeClass 的配置依赖于 运行时接口（CRI）的实现。 根据你使用的 CRI 实现，来了解如何配置。配置 CRI 的方式，每种 CRI 都有不同的配置方式。所有这些配置都具有相应的 `handler` 名，并被 RuntimeClass 引用。 handler 必须符合 DNS-1123 命名规范（字母、数字、或 `-`）。
+
+![image-20210507141301580](kata-container/image-20210507141301580.png)
+
+创建 `RuntimeClass` 资源，因为每个配置都有不同的 `handler` 针对每个 handler 需要创建一个 RuntimeClass 对象。
+
+```yaml
+apiVersion: node.k8s.io/v1  # RuntimeClass 定义于 node.k8s.io API 组
+kind: RuntimeClass
+metadata:
+  name: myclass  # 用来引用 RuntimeClass 的名字
+  # RuntimeClass 是一个集群层面的资源
+handler: myconfiguration  # 对应的 CRI 配置的名称
+```
+
+Pod 的使用方式。
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mypod
+spec:
+  runtimeClassName: myclass
+```
+
+这一设置会告诉 kubelet 使用所指的 RuntimeClass 来运行该 pod。 如果所指的 RuntimeClass 不存在或者 CRI 无法运行相应的 handler， 那么 pod 将会进入 `Failed` 终止。 你可以查看相应的事件， 获取出错信息。
+
+如果未指定 `runtimeClassName` ，则将使用默认的 RuntimeHandler，相当于禁用 RuntimeClass 功能特性。
+
+如果这种方式不可以那么可以使用注释方式运行。
+
+### CRI 配置
+
+#### containerd 的配置
+
+通过 containerd 的 `/etc/containerd/config.toml` 配置文件来配置运行时 handler。 handler 需要配置在 runtimes 块中：
+
+```toml
+[plugins.cri.containerd.runtimes.${HANDLER_NAME}]
+```
+
+#### cri-o 的配置
+
+通过 cri-o 的 `/etc/crio/crio.conf` 配置文件来配置运行时 handler。 handler 需要配置在 crio.runtime 表 下面：
+
+```toml
+[crio.runtime.runtimes.${HANDLER_NAME}]
+  runtime_path = "${PATH_TO_BINARY}"
+```
+
+### 实践
+
+#### containerd 配置
+
+添加以下配置，重启 `containerd`
+
+```toml
+      [plugins."io.containerd.grpc.v1.cri".containerd.untrusted_workload_runtime]
+        runtime_type = "io.containerd.runtime.v1.linux"
+        runtime_engine = "/usr/bin/kata-runtime"
+        runtime_root = ""
+        privileged_without_host_devices = false
+        base_runtime_spec = ""
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata]
+          runtime_type = "io.containerd.kata.v2"
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.kata.options]
+           ConfigPath = "/etc/kata-containers/config.toml"
+        [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.katacli]
+          runtime_type = "io.containerd.runc.v1"
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.katacli.options]
+
+```
+
+#### runtimeClass 创建
+
+```yaml
+apiVersion: node.k8s.io/v1  # RuntimeClass 定义于 node.k8s.io API 组
+kind: RuntimeClass
+metadata:
+  name: kata-runtime  # 用来引用 RuntimeClass 的名字
+handler: katacli  # 对应的 CRI 配置的名称
+```
+
+#### Pod 创建
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: busybox01
+spec:
+  containers:
+  - name: busybox
+    image: busybox:latest
+    command: ["/bin/sh","-c","sleep 600"]
+  runtimeClassName: kata-runtime
+```
+
+#### 验证
+
+```bash
+name=busybox01 ; crictl inspect `crictl ps -a | grep $(crictl pods | grep $name | awk -F' ' '{print $1}') | awk -F '  '{print $1}'` | grep runtime
+
+    "runtimeType": "io.containerd.runc.v1",
+    "runtimeOptions": {
+      "binary_name": "/usr/bin/kata-runtime"		# 应用的运行时
+    "runtimeSpec": {
+```
+
+# 实验内容
+
+1. 使用 `kubectl apply -f` 命令更新 Pod，验证是否可以从普通的容器转换为 `kata-container`
+
+```http
+实验结果：不可以进行转换，也不可以从 kata 转换为普通容器
+```
+
+2. 验证当主机内核更新后，kata 默认的 sandbox 内核是否会更新
+
+```http
+并不会更新，kata 中的 sandbox 内核会一直使用，主机内核不会影响 kata 中的 sandbox 内核版本
+```
+
